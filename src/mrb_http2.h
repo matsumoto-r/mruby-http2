@@ -51,7 +51,7 @@
 #define MRB_HTTP2_HEADER_MAX 128
 #define MRB_HTTP2_HEADER_NOT_FOUND -1
 
-//#define MRB_HTTP2_TRACER
+#define MRB_HTTP2_TRACER
 
 #ifdef MRB_HTTP2_TRACER
 #define TRACER printf("    >>>> %s:%d\n", __func__, __LINE__)
