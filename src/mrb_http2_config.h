@@ -19,7 +19,7 @@ typedef mrb_int mrb_http2_config_fixnum;
 typedef struct {
 
   // callback block at a phase of mapping uri to filename
-  const char *map_to_strage_cb;
+  const char *map_to_storage_cb;
 
   // callback block at a phase of access checker
   const char *access_checker_cb;

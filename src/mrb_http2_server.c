@@ -39,11 +39,18 @@ typedef struct {
   mrb_value self;
 } app_context;
 
+typedef struct mrb_http2_request_body {
+  char *data;
+  int64_t len;
+  size_t pos;
+  unsigned int last:1;
+} mrb_http2_request_body;
+
 typedef struct http2_stream_data {
   struct http2_stream_data *prev, *next;
   char *request_path;
   char *request_args;
-  char *request_body;
+  mrb_http2_request_body *request_body;
   char *unparsed_uri;
   char *percent_encode_uri;
   char method[16];
@@ -198,6 +205,10 @@ static void delete_http2_stream_data(mrb_state *mrb,
     mrb_free(mrb, stream_data->request_args);
   }
   if (stream_data->request_body != NULL) {
+    stream_data->request_body->len = 0;
+    stream_data->request_body->pos = 0;
+    stream_data->request_body->last = 0;
+    mrb_free(mrb, stream_data->request_body->data);
     mrb_free(mrb, stream_data->request_body);
   }
   if (stream_data->upstream_req != NULL) {
@@ -1353,8 +1364,13 @@ static int mrb_http2_process_request(nghttp2_session *session,
   r->unparsed_uri = stream_data->unparsed_uri;
   r->percent_encode_uri = stream_data->percent_encode_uri;
   r->uri = stream_data->request_path;
-  r->request_body = stream_data->request_body;
   r->args = stream_data->request_args;
+
+  if (stream_data->request_body != NULL) {
+    r->request_body = stream_data->request_body->data;
+  } else {
+    r->request_body = NULL;
+  }
 
   if (config->debug) {
     fprintf(stderr, "=== process request information start ===\n");
@@ -1378,7 +1394,7 @@ static int mrb_http2_process_request(nghttp2_session *session,
   if (config->callback) {
     r->phase = MRB_HTTP2_SERVER_MAP_TO_STORAGE;
     callback_ruby_block(mrb, session_data->app_ctx->self, config->callback,
-        config->cb_list->map_to_strage_cb, config->cb_list);
+        config->cb_list->map_to_storage_cb, config->cb_list);
   }
 
   if (config->debug) {
@@ -1512,7 +1528,7 @@ static int server_on_frame_recv_callback(nghttp2_session *session,
   return 0;
 }
 
-#define MRB_HTTP2_MAX_POST_DATA_SIZE 1 << 16
+#define MRB_HTTP2_MAX_POST_DATA_SIZE 1 << 24
 
 static int server_on_data_chunk_recv_callback(nghttp2_session *session,
     uint8_t flags, int32_t stream_id, const uint8_t *data, size_t len,
@@ -1527,10 +1543,15 @@ static int server_on_data_chunk_recv_callback(nghttp2_session *session,
   if (session_data->app_ctx->server->config->debug) {
     fprintf(stderr, "%s: datalen = %ld\n", __func__, len);
   }
+
   // TODO: buffering and stored file or memory, currently store len byte
   // when callback only once
-  if (stream_data->request_body != NULL) {
-    fprintf(stderr, "request_body was already storead, now stored only once");
+  if (stream_data->request_body == NULL) {
+    stream_data->request_body = mrb_malloc(mrb, sizeof(mrb_http2_request_body));
+    memset(stream_data->request_body, 0, sizeof(mrb_http2_request_body));
+  }
+  if (stream_data->request_body->last) {
+    fprintf(stderr, "request_body length reached MRB_HTTP2_MAX_POST_DATA_SIZE");
     rv = nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
         stream_data->stream_id, NGHTTP2_INTERNAL_ERROR);
     if(rv != 0) {
@@ -1538,15 +1559,29 @@ static int server_on_data_chunk_recv_callback(nghttp2_session *session,
       return NGHTTP2_ERR_CALLBACK_FAILURE;
     }
     return 0;
-  }
-  if (len > MRB_HTTP2_MAX_POST_DATA_SIZE) {
-    fprintf(stderr, "post data length(%ld) exceed "
-        "MRB_HTTP2_MAX_POST_DATA_SIZE(%d)\n", len,
-        MRB_HTTP2_MAX_POST_DATA_SIZE);
-    stream_data->request_body = mrb_http2_strcopy(mrb, (const char *)data,
-        MRB_HTTP2_MAX_POST_DATA_SIZE);
   } else {
-    stream_data->request_body = mrb_http2_strcopy(mrb, (const char *)data, len);
+    char *pos;
+    stream_data->request_body->len += len;
+    if (stream_data->request_body->len >= MRB_HTTP2_MAX_POST_DATA_SIZE) {
+      fprintf(stderr, "post data length(%ld) exceed "
+          "MRB_HTTP2_MAX_POST_DATA_SIZE(%d)\n", stream_data->request_body->len,
+          MRB_HTTP2_MAX_POST_DATA_SIZE);
+      stream_data->request_body->len = MRB_HTTP2_MAX_POST_DATA_SIZE;
+      stream_data->request_body->last = 1;
+      rv = nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
+          stream_data->stream_id, NGHTTP2_INTERNAL_ERROR);
+      if(rv != 0) {
+        fprintf(stderr, "Fatal error: %s", nghttp2_strerror(rv));
+        return NGHTTP2_ERR_CALLBACK_FAILURE;
+      }
+      return 0;
+    }
+    stream_data->request_body->data = mrb_realloc(mrb, stream_data->request_body->data, stream_data->request_body->len + 1);
+    pos = stream_data->request_body->data;
+    pos += stream_data->request_body->pos;
+    memcpy(pos, data, stream_data->request_body->len - stream_data->request_body->pos);
+    stream_data->request_body->pos += len;
+    stream_data->request_body->data[stream_data->request_body->len] = '\0';
   }
 
   return 0;
@@ -2156,7 +2191,7 @@ static mrb_value mrb_http2_server_run(mrb_state *mrb, mrb_value self)
   return self;
 }
 
-static mrb_value mrb_http2_server_set_map_to_strage_cb(mrb_state *mrb,
+static mrb_value mrb_http2_server_set_map_to_storage_cb(mrb_state *mrb,
     mrb_value self)
 {
   mrb_http2_data_t *data = DATA_PTR(self);
@@ -2167,7 +2202,7 @@ static mrb_value mrb_http2_server_set_map_to_strage_cb(mrb_state *mrb,
   mrb_get_args(mrb, "&", &b);
   mrb_gc_protect(mrb, b);
   mrb_iv_set(mrb, self, mrb_intern_cstr(mrb, cbid), b);
-  list->map_to_strage_cb = cbid;
+  list->map_to_storage_cb = cbid;
 
   return b;
 }
@@ -2887,7 +2922,7 @@ void mrb_http2_server_class_init(mrb_state *mrb, struct RClass *http2)
   mrb_define_method(mrb, server, "content_length", mrb_http2_server_content_length, MRB_ARGS_NONE());
 
   // callbacks
-  mrb_define_method(mrb, server, "set_map_to_strage_cb", mrb_http2_server_set_map_to_strage_cb, MRB_ARGS_REQ(1));
+  mrb_define_method(mrb, server, "set_map_to_storage_cb", mrb_http2_server_set_map_to_storage_cb, MRB_ARGS_REQ(1));
   mrb_define_method(mrb, server, "set_access_checker_cb", mrb_http2_server_set_access_checker_cb, MRB_ARGS_REQ(1));
   mrb_define_method(mrb, server, "set_fixups_cb", mrb_http2_server_set_fixups_cb, MRB_ARGS_REQ(1));
   mrb_define_method(mrb, server, "set_content_cb", mrb_http2_server_set_content_cb, MRB_ARGS_REQ(1));
