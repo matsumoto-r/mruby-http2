@@ -33,7 +33,7 @@ void mrb_http2_request_rec_free(mrb_state *mrb, mrb_http2_request_rec *r)
   }
 
   r->reqhdrlen = 0;
-  r->reshdrslen = 0;
+  // r->reshdrslen = 0;
   r->status = 0;
 }
 
